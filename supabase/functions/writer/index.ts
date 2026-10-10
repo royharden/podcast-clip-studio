@@ -13,6 +13,8 @@ function json(body: unknown, status = 200) {
 
 const DAILY_CAP = 200;
 
+// Fail-closed usage counter: if the RPC errors or returns a non-number,
+// return DAILY_CAP+1 so the caller blocks the request with 429 daily_cap.
 async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
   const day = new Date().toISOString().slice(0, 10);
   const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
@@ -24,11 +26,11 @@ async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: s
     },
     body: JSON.stringify({ p_fn: fn, p_day: day }),
   });
-  if (rpcRes.ok) {
-    const val = await rpcRes.json();
-    return typeof val === "number" ? val : 1;
+  if (!rpcRes.ok) {
+    return DAILY_CAP + 1;
   }
-  return 1;
+  const val = await rpcRes.json();
+  return typeof val === "number" ? val : DAILY_CAP + 1;
 }
 
 interface ClipInput {

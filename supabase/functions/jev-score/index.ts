@@ -19,6 +19,26 @@ interface ScoreInput {
   text: string;
 }
 
+// Fail-closed usage counter: if the RPC errors or returns a non-number,
+// return DAILY_CAP+1 so the caller blocks the request with 429 daily_cap.
+async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
+  const day = new Date().toISOString().slice(0, 10);
+  const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${serviceKey}`,
+      apikey: serviceKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ p_fn: fn, p_day: day }),
+  });
+  if (!rpcRes.ok) {
+    return DAILY_CAP + 1;
+  }
+  const val = await rpcRes.json();
+  return typeof val === "number" ? val : DAILY_CAP + 1;
+}
+
 function buildQuestions(items: ScoreInput[]): { state: Record<string, unknown>; questions: Record<string, unknown> } {
   const state: Record<string, unknown> = { show: "A podcast about startups and AI tools" };
   const segments: Record<string, string> = {};
@@ -65,7 +85,21 @@ function buildQuestions(items: ScoreInput[]): { state: Record<string, unknown>; 
   return { state, questions };
 }
 
-async function callJev(apiKey: string, items: ScoreInput[], show: string) {
+const DAILY_CAP_ERROR = "__daily_cap__";
+
+async function callJev(
+  apiKey: string,
+  items: ScoreInput[],
+  show: string,
+  serviceKey: string,
+  supabaseUrl: string,
+) {
+  // Count each TypeSafe fetch attempt (retries and split sub-batches each count)
+  const calls = await checkAndCountUsage(serviceKey, supabaseUrl, "jev-score");
+  if (calls > DAILY_CAP) {
+    return { dailyCap: true as const };
+  }
+
   const state: Record<string, unknown> = { show };
   const segments: Record<string, string> = {};
   for (const item of items) segments[item.key] = item.text;
@@ -78,20 +112,30 @@ async function callJev(apiKey: string, items: ScoreInput[], show: string) {
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: MODEL, state, questions: built.questions }),
   });
-  const latency_ms = Date.now() - 0;
-  return { res, latency_ms };
+  return { res, dailyCap: false as const };
 }
 
-async function callJevWithRetry(apiKey: string, items: ScoreInput[], show: string) {
+async function callJevWithRetry(
+  apiKey: string,
+  items: ScoreInput[],
+  show: string,
+  serviceKey: string,
+  supabaseUrl: string,
+) {
   const maxRetries = 3;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const started = Date.now();
-    const { res } = await callJev(apiKey, items, show);
+    const r = await callJev(apiKey, items, show, serviceKey, supabaseUrl);
     const latency_ms = Date.now() - started;
+
+    if (r.dailyCap) {
+      return { error: DAILY_CAP_ERROR, latency_ms };
+    }
+    const res = r.res;
 
     if (res.status === 429 || res.status === 529) {
       if (attempt < maxRetries - 1) {
-        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        await new Promise((p) => setTimeout(p, 1000 * Math.pow(2, attempt)));
         continue;
       }
       return { error: `Jev rate-limited after retries (status ${res.status})`, latency_ms };
@@ -107,7 +151,15 @@ async function callJevWithRetry(apiKey: string, items: ScoreInput[], show: strin
 }
 
 // Recursive: split batch in half on validation failure / question limit.
-async function scoreBatch(apiKey: string, items: ScoreInput[], show: string, depth = 0): Promise<{
+// daily_cap errors are NOT split or retried — they propagate immediately.
+async function scoreBatch(
+  apiKey: string,
+  items: ScoreInput[],
+  show: string,
+  serviceKey: string,
+  supabaseUrl: string,
+  depth = 0,
+): Promise<{
   answers: unknown[];
   usage: { input_tokens: number; output_tokens: number };
   latency_ms: number;
@@ -116,17 +168,26 @@ async function scoreBatch(apiKey: string, items: ScoreInput[], show: string, dep
 }> {
   if (items.length === 0) return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: 0, splits: 0 };
   if (items.length === 1) {
-    const r = await callJevWithRetry(apiKey, items, show);
+    const r = await callJevWithRetry(apiKey, items, show, serviceKey, supabaseUrl);
+    if (r.error === DAILY_CAP_ERROR) {
+      return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: DAILY_CAP_ERROR };
+    }
     if (r.error) return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: r.error };
     return { answers: [{ key: items[0].key, response: r.data }], usage: r.data?.usage ?? { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth };
   }
 
-  const r = await callJevWithRetry(apiKey, items, show);
+  const r = await callJevWithRetry(apiKey, items, show, serviceKey, supabaseUrl);
+  if (r.error === DAILY_CAP_ERROR) {
+    return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: DAILY_CAP_ERROR };
+  }
   if (r.error) {
     // Split in half and retry
     const mid = Math.floor(items.length / 2);
-    const left = await scoreBatch(apiKey, items.slice(0, mid), show, depth + 1);
-    const right = await scoreBatch(apiKey, items.slice(mid), show, depth + 1);
+    const left = await scoreBatch(apiKey, items.slice(0, mid), show, serviceKey, supabaseUrl, depth + 1);
+    if (left.error === DAILY_CAP_ERROR) {
+      return left;
+    }
+    const right = await scoreBatch(apiKey, items.slice(mid), show, serviceKey, supabaseUrl, depth + 1);
     return {
       answers: [...left.answers, ...right.answers],
       usage: {
@@ -153,9 +214,6 @@ Deno.serve(async (req: Request) => {
     if (!Array.isArray(segments) || segments.length === 0) {
       return json({ error: "segments array required" }, 400);
     }
-
-    const calls = await checkAndCountUsage(serviceKey, supabaseUrl, "jev-score");
-    if (calls > DAILY_CAP) return json({ error: "daily_cap" }, 429);
 
     const items: ScoreInput[] = segments.map((s: { idx: number; text: string }, i: number) => ({
       key: `s${i}`,
@@ -201,8 +259,12 @@ Deno.serve(async (req: Request) => {
     }
 
     const t0 = Date.now();
-    const result = await scoreBatch(typesafeKey, items, typeof show === "string" ? show : "");
+    const result = await scoreBatch(typesafeKey, items, typeof show === "string" ? show : "", serviceKey, supabaseUrl);
     const totalLatency = Date.now() - t0;
+
+    if (result.error === DAILY_CAP_ERROR) {
+      return json({ error: "daily_cap" }, 429);
+    }
 
     const model = result.answers?.[0]?.response?.model ?? result.answers?.[0]?.response?.model;
     const usage = result.usage ?? { input_tokens: 0, output_tokens: 0 };
@@ -227,21 +289,3 @@ Deno.serve(async (req: Request) => {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 });
-
-async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
-  const day = new Date().toISOString().slice(0, 10);
-  const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${serviceKey}`,
-      apikey: serviceKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ p_fn: fn, p_day: day }),
-  });
-  if (rpcRes.ok) {
-    const val = await rpcRes.json();
-    return typeof val === "number" ? val : 1;
-  }
-  return 1;
-}

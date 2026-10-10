@@ -13,27 +13,10 @@ function json(body: unknown, status = 200) {
 
 const DAILY_CAP = 200;
 
+// Fail-closed usage counter: if the RPC errors or returns a non-number,
+// return DAILY_CAP+1 so the caller blocks the request with 429 daily_cap.
 async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
   const day = new Date().toISOString().slice(0, 10);
-
-  // Read current count
-  const readRes = await fetch(
-    `${supabaseUrl}/rest/v1/usage_counters?fn=eq.${fn}&day=eq.${day}&select=calls`,
-    {
-      headers: {
-        Authorization: `Bearer ${serviceKey}`,
-        apikey: serviceKey,
-      },
-    },
-  );
-  if (readRes.ok) {
-    const rows = await readRes.json();
-    if (Array.isArray(rows) && rows.length > 0 && typeof rows[0].calls === "number" && rows[0].calls >= DAILY_CAP) {
-      return rows[0].calls as number;
-    }
-  }
-
-  // Upsert increment
   const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
     method: "POST",
     headers: {
@@ -43,28 +26,11 @@ async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: s
     },
     body: JSON.stringify({ p_fn: fn, p_day: day }),
   });
-
   if (!rpcRes.ok) {
-    // Fall back to plain upsert if rpc is missing
-    const upsertRes = await fetch(`${supabaseUrl}/rest/v1/usage_counters?on_conflict=day,fn`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${serviceKey}`,
-        apikey: serviceKey,
-        "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=representation",
-      },
-      body: JSON.stringify({ day, fn, calls: 1 }),
-    });
-    if (upsertRes.ok) {
-      const rows = await upsertRes.json();
-      return Array.isArray(rows) && rows[0] ? (rows[0].calls as number) : 1;
-    }
-    return 1;
+    return DAILY_CAP + 1;
   }
-
   const val = await rpcRes.json();
-  return typeof val === "number" ? val : 1;
+  return typeof val === "number" ? val : DAILY_CAP + 1;
 }
 
 interface RawSegment {

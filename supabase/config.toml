@@ -1,10 +1,10 @@
 project_id = "podcast-clip-studio"
 
 [functions.transcribe]
-verify_jwt = false
+verify_jwt = true
 
 [functions.jev-score]
-verify_jwt = false
+verify_jwt = true
 
 [functions.writer]
-verify_jwt = false
+verify_jwt = true
