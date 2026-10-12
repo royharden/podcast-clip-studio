@@ -17,6 +17,7 @@ export async function callEdgeFunction<T>(
     method: "POST",
     headers: {
       Authorization: `Bearer ${anonKey}`,
+      apikey: anonKey,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),

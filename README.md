@@ -59,6 +59,7 @@ If `TYPESAFE_API_KEY` or `OPENAI_API_KEY` are absent, the demo episode still wor
 | `OPENAI_BASE_URL` | Edge function secret | `https://api.openai.com/v1` | OpenAI-compatible endpoint override |
 | `OPENAI_TRANSCRIBE_MODEL` | Edge function secret | `whisper-1` | Transcription model |
 | `OPENAI_MODEL` | Edge function secret | `gpt-6-luna` | Writer model (no `temperature` param) |
+| `DAILY_CALL_LIMIT` | Edge function secret | `200` | Upstream calls per function per UTC day |
 | `VITE_SUPABASE_URL` | Frontend env | pre-configured | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Frontend env | pre-configured | Supabase anon key |
 
@@ -74,8 +75,8 @@ If `TYPESAFE_API_KEY` or `OPENAI_API_KEY` are absent, the demo episode still wor
 
 ## Design decisions
 
-1. **Batched Jev calls (10 segments/request).** Jev answers many questions in one request, so one HTTP call scores 10 segments × 4 questions = 40 answers. On validation failure or question-limit errors the batch is split in half and retried; 429/529 responses retry with exponential backoff (3 tries). Cost is computed as `input_tokens × $0.042 / 1M` (output tokens are free).
+1. **Batched Jev calls (10 segments/request).** Jev answers many questions in one request, so one HTTP call scores 10 segments × 4 questions = 40 answers. On validation failure or question-limit errors (400/413/422) the batch is split in half and retried; 429/529 responses and network errors are retried once (2 attempts max). Every attempt and split counts toward the daily cap. Cost is computed as `input_tokens × $0.042 / 1M` (output tokens are free).
 2. **Ranking in code.** `clipScore = (hook/4) × (0.6 + 0.4·standalone) × (risky ≥ 0.5 ? 0 : 1) × (filler ? 0.2 : 1)`. Top 5 non-overlapping clips with ≥ 60 s spacing, 15–75 s duration, one-segment backward extension when `standalone < 0.5`, and a "low confidence" flag when hook confidence < 0.4.
 3. **The risky-content gate.** Any segment Jev flags as risky (probability ≥ 0.5) is hard-gated to score 0. A clip that could be defamatory or embarrassing out of context never makes the top 5, no matter how strong the hook.
-4. **Daily cap.** Every function counts calls per UTC day in `usage_counters` (atomic increment via a SQL function). Above 200 calls/day per function, functions return `429 {error:"daily_cap"}` and the UI switches to the bundled demo episode with a "Daily demo limit reached" banner.
-5. **Exactly 3 edge functions.** `transcribe`, `jev-score`, `writer` — all external API calls stay server-side; keys never reach the browser. The frontend talks to Supabase directly for data and Storage.
+4. **Daily cap.** Every function counts its upstream API calls per UTC day in `usage_counters` (atomic increment via a service-role-only SQL function, called right before each paid request). Above 200 calls/day per function (override with `DAILY_CALL_LIMIT`), functions return `429 {error:"daily_limit"}` and the UI shows a "Daily demo limit reached" banner. The counter fails closed: if it can't be read, functions return `503`.
+5. **Exactly 3 edge functions.** `transcribe`, `jev-score`, `writer` — all external API calls stay server-side; keys never reach the browser. The frontend reads data and inserts pipeline results directly (no UPDATE/DELETE); upload-episode progress and stats are written by the functions with the service role.

@@ -1,3 +1,5 @@
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.117.3";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -11,32 +13,106 @@ function json(body: unknown, status = 200) {
   });
 }
 
-const DAILY_CAP = 200;
+const DEFAULT_DAILY_CALL_LIMIT = 200;
 const MODEL = "jev-1.13.0";
+const MAX_BODY_BYTES = 256 * 1024;
+const MAX_SEGMENTS = 10; // the client scores in batches of 10
+const MAX_SEGMENT_TEXT_CHARS = 4000;
+const MAX_SHOW_CHARS = 2000;
+// Retry only on 429 / 529 / network errors, at most 2 attempts in total.
+const MAX_ATTEMPTS = 2;
+// TypeSafe validation / question-limit rejections: worth retrying as two smaller batches.
+const SPLITTABLE_STATUSES = new Set([400, 413, 422]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface ScoreInput {
   key: string; // e.g. "s12"
   text: string;
 }
 
-// Fail-closed usage counter: if the RPC errors or returns a non-number,
-// return DAILY_CAP+1 so the caller blocks the request with 429 daily_cap.
-async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
+interface JevUsage {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+type JevResponse = Record<string, unknown> & { model?: string; usage?: Partial<JevUsage> };
+
+interface JevAnswer {
+  key?: string;
+  batch?: string[];
+  response: JevResponse;
+}
+
+function dailyCallLimit(): number {
+  const raw = Deno.env.get("DAILY_CALL_LIMIT")?.trim();
+  return raw && /^\d{1,9}$/.test(raw) ? Number(raw) : DEFAULT_DAILY_CALL_LIMIT;
+}
+
+type UsageCheck = "ok" | "daily_limit" | "unavailable";
+
+// Fail-closed usage counter: an RPC error, a thrown error, or a missing / non-integer
+// result is reported as "unavailable" so the caller blocks the request.
+async function checkAndCountUsage(supabase: SupabaseClient, fn: string): Promise<UsageCheck> {
   const day = new Date().toISOString().slice(0, 10);
-  const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${serviceKey}`,
-      apikey: serviceKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ p_fn: fn, p_day: day }),
-  });
-  if (!rpcRes.ok) {
-    return DAILY_CAP + 1;
+  try {
+    const { data, error } = await supabase.rpc("pcs_increment_usage", { p_fn: fn, p_day: day });
+    if (error) {
+      console.error(`[${fn}] usage counter failed`, error);
+      return "unavailable";
+    }
+    if (typeof data !== "number" || !Number.isInteger(data)) {
+      console.error(`[${fn}] usage counter returned a non-integer`, data);
+      return "unavailable";
+    }
+    return data > dailyCallLimit() ? "daily_limit" : "ok";
+  } catch (err) {
+    console.error(`[${fn}] usage counter threw`, err);
+    return "unavailable";
   }
-  const val = await rpcRes.json();
-  return typeof val === "number" ? val : DAILY_CAP + 1;
+}
+
+function usageBlocked(check: Exclude<UsageCheck, "ok">) {
+  return check === "daily_limit"
+    ? json({ error: "daily_limit" }, 429)
+    : json({ error: "usage_unavailable" }, 503);
+}
+
+// Reads the request body with a hard byte cap (413) and parses it as a JSON object (400).
+async function readJsonBody(
+  req: Request,
+  maxBytes: number,
+): Promise<{ body: Record<string, unknown> } | { res: Response }> {
+  const tooLarge = { res: json({ error: "payload_too_large" }, 413) };
+  const invalid = { res: json({ error: "invalid_json" }, 400) };
+  if (Number(req.headers.get("content-length") ?? 0) > maxBytes) return tooLarge;
+  if (!req.body) return invalid;
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return tooLarge;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return invalid;
+    return { body: parsed as Record<string, unknown> };
+  } catch {
+    return invalid;
+  }
 }
 
 function buildQuestions(items: ScoreInput[]): { state: Record<string, unknown>; questions: Record<string, unknown> } {
@@ -85,21 +161,26 @@ function buildQuestions(items: ScoreInput[]): { state: Record<string, unknown>; 
   return { state, questions };
 }
 
-const DAILY_CAP_ERROR = "__daily_cap__";
+const ZERO_USAGE: JevUsage = { input_tokens: 0, output_tokens: 0 };
 
-async function callJev(
+function toUsage(u: Partial<JevUsage> | undefined): JevUsage {
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+  return { input_tokens: n(u?.input_tokens), output_tokens: n(u?.output_tokens) };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type JevAttempt =
+  | { kind: "ok"; data: JevResponse; latency_ms: number }
+  | { kind: "blocked"; reason: Exclude<UsageCheck, "ok">; latency_ms: number }
+  | { kind: "error"; status: number; latency_ms: number };
+
+async function callJevWithRetry(
+  supabase: SupabaseClient,
   apiKey: string,
   items: ScoreInput[],
   show: string,
-  serviceKey: string,
-  supabaseUrl: string,
-) {
-  // Count each TypeSafe fetch attempt (retries and split sub-batches each count)
-  const calls = await checkAndCountUsage(serviceKey, supabaseUrl, "jev-score");
-  if (calls > DAILY_CAP) {
-    return { dailyCap: true as const };
-  }
-
+): Promise<JevAttempt> {
   const state: Record<string, unknown> = { show };
   const segments: Record<string, string> = {};
   for (const item of items) segments[item.key] = item.text;
@@ -107,118 +188,164 @@ async function callJev(
   const built = buildQuestions(items);
   if (show) state.show = show;
 
-  const res = await fetch("https://api.typesafe.ai/v1/systemone", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, state, questions: built.questions }),
-  });
-  return { res, dailyCap: false as const };
-}
+  let latency_ms = 0;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Count each TypeSafe fetch attempt (retries and split sub-batches each count).
+    // A daily_limit or counter failure is never retried.
+    const usage = await checkAndCountUsage(supabase, "jev-score");
+    if (usage !== "ok") return { kind: "blocked", reason: usage, latency_ms };
 
-async function callJevWithRetry(
-  apiKey: string,
-  items: ScoreInput[],
-  show: string,
-  serviceKey: string,
-  supabaseUrl: string,
-) {
-  const maxRetries = 3;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
     const started = Date.now();
-    const r = await callJev(apiKey, items, show, serviceKey, supabaseUrl);
-    const latency_ms = Date.now() - started;
-
-    if (r.dailyCap) {
-      return { error: DAILY_CAP_ERROR, latency_ms };
-    }
-    const res = r.res;
-
-    if (res.status === 429 || res.status === 529) {
-      if (attempt < maxRetries - 1) {
-        await new Promise((p) => setTimeout(p, 1000 * Math.pow(2, attempt)));
+    let res: Response;
+    try {
+      res = await fetch("https://api.typesafe.ai/v1/systemone", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: MODEL, state, questions: built.questions }),
+      });
+    } catch (err) {
+      latency_ms = Date.now() - started;
+      console.error(`[jev-score] network error (attempt ${attempt}/${MAX_ATTEMPTS})`, err);
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(1000);
         continue;
       }
-      return { error: `Jev rate-limited after retries (status ${res.status})`, latency_ms };
+      return { kind: "error", status: 0, latency_ms };
+    }
+    latency_ms = Date.now() - started;
+
+    if (res.status === 429 || res.status === 529) {
+      await res.body?.cancel();
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(1000);
+        continue;
+      }
+      console.error(`[jev-score] rate-limited after ${MAX_ATTEMPTS} attempts (status ${res.status})`);
+      return { kind: "error", status: res.status, latency_ms };
     }
     if (!res.ok) {
       const detail = await res.text();
-      return { error: `Jev request failed: ${res.status} ${detail.slice(0, 200)}`, latency_ms };
+      console.error(`[jev-score] request failed: ${res.status} ${detail.slice(0, 500)}`);
+      return { kind: "error", status: res.status, latency_ms };
     }
-    const data = await res.json();
-    return { data, latency_ms };
+    try {
+      return { kind: "ok", data: (await res.json()) as JevResponse, latency_ms };
+    } catch (err) {
+      console.error("[jev-score] invalid JSON from TypeSafe", err);
+      return { kind: "error", status: 502, latency_ms };
+    }
   }
-  return { error: "unreachable", latency_ms: 0 };
+  return { kind: "error", status: 0, latency_ms };
 }
 
-// Recursive: split batch in half on validation failure / question limit.
-// daily_cap errors are NOT split or retried — they propagate immediately.
-async function scoreBatch(
-  apiKey: string,
-  items: ScoreInput[],
-  show: string,
-  serviceKey: string,
-  supabaseUrl: string,
-  depth = 0,
-): Promise<{
-  answers: unknown[];
-  usage: { input_tokens: number; output_tokens: number };
+interface BatchResult {
+  answers: JevAnswer[];
+  usage: JevUsage;
   latency_ms: number;
   splits: number;
   error?: string;
-}> {
-  if (items.length === 0) return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: 0, splits: 0 };
-  if (items.length === 1) {
-    const r = await callJevWithRetry(apiKey, items, show, serviceKey, supabaseUrl);
-    if (r.error === DAILY_CAP_ERROR) {
-      return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: DAILY_CAP_ERROR };
-    }
-    if (r.error) return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: r.error };
-    return { answers: [{ key: items[0].key, response: r.data }], usage: r.data?.usage ?? { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth };
-  }
+  blocked?: Exclude<UsageCheck, "ok">;
+}
 
-  const r = await callJevWithRetry(apiKey, items, show, serviceKey, supabaseUrl);
-  if (r.error === DAILY_CAP_ERROR) {
-    return { answers: [], usage: { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth, error: DAILY_CAP_ERROR };
+// Recursive: split batch in half on validation failure / question limit.
+// daily_limit / counter failures are NOT split or retried — they propagate immediately.
+async function scoreBatch(
+  supabase: SupabaseClient,
+  apiKey: string,
+  items: ScoreInput[],
+  show: string,
+  depth = 0,
+): Promise<BatchResult> {
+  if (items.length === 0) return { answers: [], usage: ZERO_USAGE, latency_ms: 0, splits: 0 };
+
+  const r = await callJevWithRetry(supabase, apiKey, items, show);
+  if (r.kind === "blocked") {
+    return { answers: [], usage: ZERO_USAGE, latency_ms: r.latency_ms, splits: depth, blocked: r.reason };
   }
-  if (r.error) {
+  if (r.kind === "error") {
+    if (items.length === 1 || !SPLITTABLE_STATUSES.has(r.status)) {
+      return { answers: [], usage: ZERO_USAGE, latency_ms: r.latency_ms, splits: depth, error: `status ${r.status}` };
+    }
     // Split in half and retry
     const mid = Math.floor(items.length / 2);
-    const left = await scoreBatch(apiKey, items.slice(0, mid), show, serviceKey, supabaseUrl, depth + 1);
-    if (left.error === DAILY_CAP_ERROR) {
-      return left;
-    }
-    const right = await scoreBatch(apiKey, items.slice(mid), show, serviceKey, supabaseUrl, depth + 1);
+    const left = await scoreBatch(supabase, apiKey, items.slice(0, mid), show, depth + 1);
+    if (left.blocked) return left;
+    const right = await scoreBatch(supabase, apiKey, items.slice(mid), show, depth + 1);
     return {
       answers: [...left.answers, ...right.answers],
       usage: {
-        input_tokens: (left.usage?.input_tokens ?? 0) + (right.usage?.input_tokens ?? 0),
-        output_tokens: (left.usage?.output_tokens ?? 0) + (right.usage?.output_tokens ?? 0),
+        input_tokens: left.usage.input_tokens + right.usage.input_tokens,
+        output_tokens: left.usage.output_tokens + right.usage.output_tokens,
       },
-      latency_ms: (left.latency_ms ?? 0) + (right.latency_ms ?? 0),
+      latency_ms: left.latency_ms + right.latency_ms,
       splits: depth + 1,
       error: left.error ?? right.error,
+      blocked: right.blocked,
     };
   }
-  return { answers: [{ batch: items.map((i) => i.key), response: r.data }], usage: r.data?.usage ?? { input_tokens: 0, output_tokens: 0 }, latency_ms: r.latency_ms ?? 0, splits: depth };
+  const usage = toUsage(r.data.usage);
+  if (items.length === 1) {
+    return { answers: [{ key: items[0].key, response: r.data }], usage, latency_ms: r.latency_ms, splits: depth };
+  }
+  return { answers: [{ batch: items.map((i) => i.key), response: r.data }], usage, latency_ms: r.latency_ms, splits: depth };
+}
+
+// Upload episodes get their Jev stats written here with the service role (the browser has
+// no UPDATE on episodes). Best effort: a failure is logged, never surfaced to the client.
+async function recordEpisodeUsage(supabase: SupabaseClient, episodeId: string, costUsd: number, latencyMs: number) {
+  try {
+    const { error } = await supabase.rpc("pcs_record_episode_usage", {
+      p_episode_id: episodeId,
+      p_fn: "jev-score",
+      p_cost_usd: costUsd,
+      p_latency_ms: latencyMs,
+      p_status: null,
+    });
+    if (error) console.error("[jev-score] episode usage update failed", error);
+  } catch (err) {
+    console.error("[jev-score] episode usage update threw", err);
+  }
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceKey) {
+      console.error("[jev-score] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+      return json({ error: "service_unavailable" }, 503);
+    }
     const typesafeKey = Deno.env.get("TYPESAFE_API_KEY") ?? "";
 
-    const { segments, show, episode_id, mock: mockFlag } = await req.json();
+    const parsed = await readJsonBody(req, MAX_BODY_BYTES);
+    if ("res" in parsed) return parsed.res;
+    const { segments, show, episode_id, mock: mockFlag } = parsed.body;
+
     if (!Array.isArray(segments) || segments.length === 0) {
       return json({ error: "segments array required" }, 400);
     }
+    if (segments.length > MAX_SEGMENTS) {
+      return json({ error: `at most ${MAX_SEGMENTS} segments per request` }, 422);
+    }
+    if (episode_id !== undefined && episode_id !== null && (typeof episode_id !== "string" || !UUID_RE.test(episode_id))) {
+      return json({ error: "invalid episode_id" }, 400);
+    }
+    const showText = typeof show === "string" ? show : "";
+    if (showText.length > MAX_SHOW_CHARS) {
+      return json({ error: `show must be at most ${MAX_SHOW_CHARS} characters` }, 422);
+    }
 
-    const items: ScoreInput[] = segments.map((s: { idx: number; text: string }, i: number) => ({
-      key: `s${i}`,
-      text: String(s.text ?? "").slice(0, 4000),
-    }));
+    const items: ScoreInput[] = [];
+    for (const [i, s] of segments.entries()) {
+      const text = s && typeof s === "object" ? (s as { text?: unknown }).text : undefined;
+      if (typeof text !== "string") return json({ error: "each segment needs a text string" }, 400);
+      if (text.length > MAX_SEGMENT_TEXT_CHARS) {
+        return json({ error: `segment text must be at most ${MAX_SEGMENT_TEXT_CHARS} characters` }, 422);
+      }
+      items.push({ key: `s${i}`, text });
+    }
 
     const mock = mockFlag === true;
     if (!typesafeKey && !mock) {
@@ -258,24 +385,30 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    const supabase = createClient(supabaseUrl, serviceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+
     const t0 = Date.now();
-    const result = await scoreBatch(typesafeKey, items, typeof show === "string" ? show : "", serviceKey, supabaseUrl);
+    const result = await scoreBatch(supabase, typesafeKey, items, showText);
     const totalLatency = Date.now() - t0;
 
-    if (result.error === DAILY_CAP_ERROR) {
-      return json({ error: "daily_cap" }, 429);
-    }
+    if (result.blocked) return usageBlocked(result.blocked);
 
-    const model = result.answers?.[0]?.response?.model ?? result.answers?.[0]?.response?.model;
-    const usage = result.usage ?? { input_tokens: 0, output_tokens: 0 };
+    const model = result.answers[0]?.response?.model;
+    const usage = result.usage;
     const cost_usd = (usage.input_tokens * 0.042) / 1_000_000;
 
     if (result.error) {
-      console.log(`[jev-score] batch split retries=${result.splits} error=${result.error}`);
-      return json({ error: result.error, model: MODEL, usage, latency_ms: totalLatency, cost_usd, answers: result.answers }, 502);
+      console.error(`[jev-score] batch split retries=${result.splits} error=${result.error}`);
+      return json({ error: "scoring_failed", model: MODEL, usage, latency_ms: totalLatency, cost_usd, answers: result.answers }, 502);
     }
 
     console.log(`[jev-score] model=${model} segments=${segments.length} splits=${result.splits} input_tokens=${usage.input_tokens} cost_usd=${cost_usd.toFixed(6)} latency_ms=${totalLatency}`);
+
+    if (typeof episode_id === "string") {
+      await recordEpisodeUsage(supabase, episode_id, cost_usd, totalLatency);
+    }
 
     return json({
       episode_id: episode_id ?? null,
@@ -286,6 +419,7 @@ Deno.serve(async (req: Request) => {
       cost_usd,
     });
   } catch (err) {
-    return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+    console.error("[jev-score] unhandled error", err);
+    return json({ error: "internal_error" }, 500);
   }
 });

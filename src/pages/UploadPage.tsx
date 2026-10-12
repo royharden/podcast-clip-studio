@@ -151,6 +151,7 @@ export function UploadPage({ onDone }: { onDone: (episodeId: string) => void }) 
               value={showDescription}
               onChange={(e) => setShowDescription(e.target.value)}
               disabled={busy}
+              maxLength={2000}
               rows={2}
               placeholder="A podcast about startups and AI tools"
               className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-amber-500"

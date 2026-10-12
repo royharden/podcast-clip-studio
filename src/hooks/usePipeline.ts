@@ -1,8 +1,8 @@
 import { useCallback, useState } from "react";
 import { supabase, callEdgeFunction } from "@/lib/supabase";
 import { DEMO_SHOW, DEMO_SEGMENTS, DEMO_PEAKS, DEMO_DURATION_S } from "@/lib/demoEpisode";
-import { pickClips, toScoredSegments } from "@/lib/clips";
-import type { Clip, Episode, Segment, Step } from "@/types";
+import { pickClips } from "@/lib/clips";
+import type { Clip, ClipType, Episode, Step } from "@/types";
 
 export interface PipelineState {
   step: Step;
@@ -58,7 +58,7 @@ interface WriterChaptersResponse {
 }
 
 function isDailyCap(err: unknown): boolean {
-  return (err as { body?: { error?: string } }).body?.error === "daily_cap";
+  return (err as { body?: { error?: string } }).body?.error === "daily_limit";
 }
 
 export function usePipeline() {
@@ -75,6 +75,9 @@ export function usePipeline() {
       let peaks: number[] | null = null;
       let duration = 0;
       let mergedSegments: { start: number; end: number; text: string }[] = [];
+      // Upload episodes are inserted up front (transcribe checks the row); their progress and
+      // stats are then recorded by the edge functions. Demo episodes are inserted once at the end.
+      let uploadEpisode: Episode | null = null;
 
       if (demo) {
         duration = DEMO_DURATION_S;
@@ -106,6 +109,7 @@ export function usePipeline() {
           .select()
           .single();
         if (epErr || !ep) throw new Error(`Could not create episode: ${epErr?.message ?? "unknown"}`);
+        uploadEpisode = ep as Episode;
         setState((s) => ({ ...s, episode: ep as Episode }));
 
         const res = await callEdgeFunction<TranscribeResponse>("transcribe", {
@@ -114,8 +118,6 @@ export function usePipeline() {
         });
         mergedSegments = res.merged_segments;
         duration = res.duration_s;
-
-        await supabase.from("episodes").update({ status: "scoring", duration_s: duration }).eq("id", ep.id);
       } else {
         throw new Error("No file provided.");
       }
@@ -126,18 +128,7 @@ export function usePipeline() {
 
       // --- Jev scoring: batch up to 10 segments per request ---
       const showDesc = demo ? DEMO_SHOW : showDescription || DEMO_SHOW;
-      const episodeId = demo ? null : state.episode?.id;
-
-      let workingEpisodeId = episodeId;
-      if (!workingEpisodeId && !demo) {
-        // episode was inserted above; re-fetch its id from state via a fresh query
-        const { data: latest } = await supabase
-          .from("episodes")
-          .select("id")
-          .eq("audio_path", audioPath)
-          .maybeSingle();
-        workingEpisodeId = latest?.id ?? null;
-      }
+      const uploadEpisodeId = uploadEpisode?.id ?? null;
 
       let jevCalls = 0;
       let jevCost = 0;
@@ -160,7 +151,7 @@ export function usePipeline() {
         let jevRes: JevScoreResponse;
         try {
           jevRes = await callEdgeFunction<JevScoreResponse>("jev-score", {
-            episode_id: workingEpisodeId,
+            episode_id: uploadEpisodeId,
             show: showDesc,
             mock: demo,
             segments: batch.map((s, j) => ({ idx: i + j, text: s.text })),
@@ -214,40 +205,8 @@ export function usePipeline() {
         setState((s) => ({ ...s, scoredCount: scored.length }));
       }
 
-      // --- Persist episode + segments ---
-      let finalEpisodeId = workingEpisodeId;
-      if (!finalEpisodeId) {
-        const { data: ep, error } = await supabase
-          .from("episodes")
-          .insert({
-            title,
-            show_description: showDesc,
-            audio_path: audioPath,
-            status: "writing",
-            source: demo ? "demo" : "upload",
-            duration_s: duration,
-            waveform_peaks: peaks,
-          })
-          .select()
-          .single();
-        if (error || !ep) throw new Error(`Could not save episode: ${error?.message ?? "unknown"}`);
-        finalEpisodeId = (ep as Episode).id;
-      } else {
-        await supabase
-          .from("episodes")
-          .update({ status: "writing", waveform_peaks: peaks, jev_calls: jevCalls, jev_cost_usd: jevCost, jev_latency_ms_sum: jevLatency })
-          .eq("id", finalEpisodeId);
-      }
-
-      const { data: segRows, error: segErr } = await supabase
-        .from("segments")
-        .insert(scored.map((s) => ({ ...s, episode_id: finalEpisodeId })))
-        .select();
-      if (segErr || !segRows) throw new Error(`Could not save segments: ${segErr?.message ?? "unknown"}`);
-      const savedSegments = segRows as Segment[];
-
       // --- Clip picking in code ---
-      const picked = pickClips(toScoredSegments(savedSegments), 5);
+      const picked = pickClips(scored.map((s) => ({ ...s, clip_type: s.clip_type as ClipType })), 5);
       setState((s) => ({ ...s, step: "writing" }));
 
       // --- Writer: clip copy + chapters ---
@@ -264,6 +223,7 @@ export function usePipeline() {
           const w = await callEdgeFunction<WriterClipCopyResponse>("writer", {
             mode: "clip_copy",
             mock: demo,
+            episode_id: uploadEpisodeId,
             clip: {
               clip_id: "pending",
               text: clip.text,
@@ -288,7 +248,6 @@ export function usePipeline() {
           hashtags = ["#podcast", "#clip", "#listen"];
         }
         clipRows.push({
-          episode_id: finalEpisodeId,
           start_s: clip.startS,
           end_s: clip.endS,
           segment_ids: clip.segmentIds,
@@ -301,17 +260,18 @@ export function usePipeline() {
       }
 
       // Chapters
-      let chapterRows: { episode_id: string; start_s: number; title: string }[] = [];
+      let chapterRows: { start_s: number; title: string }[] = [];
       try {
         const ch = await callEdgeFunction<WriterChaptersResponse>("writer", {
           mode: "chapters",
           mock: demo,
+          episode_id: uploadEpisodeId,
           segments: scored.map((s) => ({ idx: s.idx, start_s: s.start_s, text: s.text })),
         });
         writerCalls += 1;
         writerCost += ch.cost_usd ?? 0;
         writerLatency += ch.latency_ms ?? 0;
-        chapterRows = ch.chapters.map((c) => ({ episode_id: finalEpisodeId, start_s: c.start_s, title: c.title }));
+        chapterRows = ch.chapters.map((c) => ({ start_s: c.start_s, title: c.title }));
       } catch {
         // Fallback: chapters every ~5 minutes at real segment starts
         const segs = scored.map((s) => ({ idx: s.idx, start_s: s.start_s, text: s.text }));
@@ -319,40 +279,68 @@ export function usePipeline() {
         let n = 1;
         for (const s of segs) {
           if (s.start_s >= curStart) {
-            chapterRows.push({ episode_id: finalEpisodeId, start_s: s.start_s, title: `Chapter ${n}` });
+            chapterRows.push({ start_s: s.start_s, title: `Chapter ${n}` });
             curStart += 300;
             n += 1;
           }
         }
       }
 
+      // --- Persist (insert-only: the browser has no UPDATE on these tables) ---
+      let savedEpisode = uploadEpisode;
+      if (!savedEpisode) {
+        const { data: ep, error } = await supabase
+          .from("episodes")
+          .insert({
+            title,
+            show_description: showDesc,
+            audio_path: audioPath,
+            status: "ready",
+            source: demo ? "demo" : "upload",
+            duration_s: duration,
+            waveform_peaks: peaks,
+            jev_calls: jevCalls,
+            jev_cost_usd: jevCost,
+            jev_latency_ms_sum: jevLatency,
+            writer_calls: writerCalls,
+            writer_cost_usd: writerCost,
+            writer_latency_ms_sum: writerLatency,
+          })
+          .select()
+          .single();
+        if (error || !ep) throw new Error(`Could not save episode: ${error?.message ?? "unknown"}`);
+        savedEpisode = ep as Episode;
+      }
+      const finalEpisodeId = savedEpisode.id;
+
+      const { error: segErr } = await supabase
+        .from("segments")
+        .insert(scored.map((s) => ({ ...s, episode_id: finalEpisodeId })));
+      if (segErr) throw new Error(`Could not save segments: ${segErr.message}`);
+
       const { data: savedClips, error: clipErr } = await supabase
         .from("clips")
-        .insert(clipRows)
+        .insert(clipRows.map((c) => ({ ...c, episode_id: finalEpisodeId })))
         .select();
       if (clipErr) throw new Error(`Could not save clips: ${clipErr.message}`);
 
-      const { error: chapErr } = await supabase.from("chapters").insert(chapterRows);
+      const { error: chapErr } = await supabase
+        .from("chapters")
+        .insert(chapterRows.map((c) => ({ ...c, episode_id: finalEpisodeId })));
       if (chapErr) throw new Error(`Could not save chapters: ${chapErr.message}`);
 
       const { data: epFinal } = await supabase
         .from("episodes")
-        .update({
-          status: "ready",
-          writer_calls: writerCalls,
-          writer_cost_usd: writerCost,
-          writer_latency_ms_sum: writerLatency,
-        })
-        .eq("id", finalEpisodeId)
         .select()
-        .single();
+        .eq("id", finalEpisodeId)
+        .maybeSingle();
 
       setState({
         step: "done",
         error: null,
         scoredCount: scored.length,
         totalSegments: mergedSegments.length,
-        episode: (epFinal as Episode) ?? null,
+        episode: (epFinal as Episode | null) ?? savedEpisode,
         clips: (savedClips as Clip[]) ?? [],
         dailyCapReached: false,
       });
@@ -360,7 +348,7 @@ export function usePipeline() {
       const message = err instanceof Error ? err.message : String(err);
       setState((s) => ({ ...s, step: "upload", error: message }));
     }
-  }, [state.episode]);
+  }, []);
 
   return { state, run, reset };
 }

@@ -1,3 +1,5 @@
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.117.3";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -11,32 +13,111 @@ function json(body: unknown, status = 200) {
   });
 }
 
-const DAILY_CAP = 200;
+const DEFAULT_DAILY_CALL_LIMIT = 200;
+const MAX_BODY_BYTES = 512 * 1024;
+const MAX_MOCK_SEGMENTS = 2000;
+const MAX_SEGMENT_TEXT_CHARS = 4000;
+const MAX_EPISODE_ID_CHARS = 64;
+const MAX_AUDIO_PATH_CHARS = 256;
 
-// Fail-closed usage counter: if the RPC errors or returns a non-number,
-// return DAILY_CAP+1 so the caller blocks the request with 429 daily_cap.
-async function checkAndCountUsage(serviceKey: string, supabaseUrl: string, fn: string): Promise<number> {
+// Uploads are stored as "<uuid>.<ext>": exactly one path segment, so no "/", "\", "..",
+// "%", "?" or "#" can steer the storage request outside the episodes bucket. The
+// storage client concatenates the path into the URL unencoded, so this check is the guard.
+const AUDIO_PATH_RE = /^[A-Za-z0-9-]{1,64}\.[A-Za-z0-9]{1,5}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function dailyCallLimit(): number {
+  const raw = Deno.env.get("DAILY_CALL_LIMIT")?.trim();
+  return raw && /^\d{1,9}$/.test(raw) ? Number(raw) : DEFAULT_DAILY_CALL_LIMIT;
+}
+
+type UsageCheck = "ok" | "daily_limit" | "unavailable";
+
+// Fail-closed usage counter: an RPC error, a thrown error, or a missing / non-integer
+// result is reported as "unavailable" so the caller blocks the request.
+async function checkAndCountUsage(supabase: SupabaseClient, fn: string): Promise<UsageCheck> {
   const day = new Date().toISOString().slice(0, 10);
-  const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/pcs_increment_usage`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${serviceKey}`,
-      apikey: serviceKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ p_fn: fn, p_day: day }),
-  });
-  if (!rpcRes.ok) {
-    return DAILY_CAP + 1;
+  try {
+    const { data, error } = await supabase.rpc("pcs_increment_usage", { p_fn: fn, p_day: day });
+    if (error) {
+      console.error(`[${fn}] usage counter failed`, error);
+      return "unavailable";
+    }
+    if (typeof data !== "number" || !Number.isInteger(data)) {
+      console.error(`[${fn}] usage counter returned a non-integer`, data);
+      return "unavailable";
+    }
+    return data > dailyCallLimit() ? "daily_limit" : "ok";
+  } catch (err) {
+    console.error(`[${fn}] usage counter threw`, err);
+    return "unavailable";
   }
-  const val = await rpcRes.json();
-  return typeof val === "number" ? val : DAILY_CAP + 1;
+}
+
+function usageBlocked(check: Exclude<UsageCheck, "ok">) {
+  return check === "daily_limit"
+    ? json({ error: "daily_limit" }, 429)
+    : json({ error: "usage_unavailable" }, 503);
+}
+
+// Reads the request body with a hard byte cap (413) and parses it as a JSON object (400).
+async function readJsonBody(
+  req: Request,
+  maxBytes: number,
+): Promise<{ body: Record<string, unknown> } | { res: Response }> {
+  const tooLarge = { res: json({ error: "payload_too_large" }, 413) };
+  const invalid = { res: json({ error: "invalid_json" }, 400) };
+  if (Number(req.headers.get("content-length") ?? 0) > maxBytes) return tooLarge;
+  if (!req.body) return invalid;
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return tooLarge;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return invalid;
+    return { body: parsed as Record<string, unknown> };
+  } catch {
+    return invalid;
+  }
 }
 
 interface RawSegment {
   start: number;
   end: number;
   text: string;
+}
+
+// Mock segments come from the client (demo episode), so bound their count and size.
+function parseMockSegments(value: unknown): RawSegment[] | null {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > MAX_MOCK_SEGMENTS) return null;
+  const out: RawSegment[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const { start, end, text } = item as Record<string, unknown>;
+    if (typeof start !== "number" || !Number.isFinite(start)) return null;
+    if (typeof end !== "number" || !Number.isFinite(end)) return null;
+    if (typeof text !== "string" || text.length > MAX_SEGMENT_TEXT_CHARS) return null;
+    out.push({ start, end, text });
+  }
+  return out;
 }
 
 // Merge raw whisper segments into ~20-40s segments that break at sentence ends.
@@ -79,13 +160,19 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceKey) {
+      console.error("[transcribe] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+      return json({ error: "service_unavailable" }, 503);
+    }
     const openaiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
     const baseUrl = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
     const model = Deno.env.get("OPENAI_TRANSCRIBE_MODEL") ?? "whisper-1";
 
-    const { episode_id, audio_path, mock, mock_segments } = await req.json();
+    const parsed = await readJsonBody(req, MAX_BODY_BYTES);
+    if ("res" in parsed) return parsed.res;
+    const { episode_id, audio_path, mock, mock_segments } = parsed.body;
     const useMock = mock === true;
 
     if (!useMock && !openaiKey) {
@@ -94,20 +181,45 @@ Deno.serve(async (req: Request) => {
     if (!episode_id || !audio_path) {
       return json({ error: "episode_id and audio_path required" }, 400);
     }
-
-    const calls = await checkAndCountUsage(serviceKey, supabaseUrl, "transcribe");
-    if (calls > DAILY_CAP) {
-      return json({ error: "daily_cap" }, 429);
+    if (
+      typeof episode_id !== "string" || episode_id.length > MAX_EPISODE_ID_CHARS ||
+      typeof audio_path !== "string" || audio_path.length > MAX_AUDIO_PATH_CHARS
+    ) {
+      return json({ error: "invalid episode_id or audio_path" }, 400);
     }
 
-    // Download from Storage
-    const fileRes = await fetch(`${supabaseUrl}/storage/v1/object/episodes/${audio_path}`, {
-      headers: { Authorization: `Bearer ${serviceKey}` },
+    let mockRaw: RawSegment[] = [];
+    if (useMock) {
+      const segs = parseMockSegments(mock_segments);
+      if (!segs) return json({ error: "invalid_mock_segments" }, 422);
+      mockRaw = segs;
+    }
+
+    const supabase = createClient(supabaseUrl, serviceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
-    if (!fileRes.ok) {
-      return json({ error: `failed to fetch audio: ${fileRes.status}` }, 500);
+
+    if (!useMock) {
+      if (!AUDIO_PATH_RE.test(audio_path)) {
+        return json({ error: "invalid_audio_path" }, 400);
+      }
+      // Only transcribe a file that its episode row actually points at.
+      if (!UUID_RE.test(episode_id)) {
+        return json({ error: "episode_not_found" }, 404);
+      }
+      const { data: episode, error: epErr } = await supabase
+        .from("episodes")
+        .select("audio_path")
+        .eq("id", episode_id)
+        .maybeSingle();
+      if (epErr) console.error("[transcribe] episode lookup failed", epErr);
+      if (epErr || !episode || episode.audio_path !== audio_path) {
+        return json({ error: "episode_not_found" }, 404);
+      }
     }
-    const fileBuffer = await fileRes.arrayBuffer();
+
+    const usage = await checkAndCountUsage(supabase, "transcribe");
+    if (usage !== "ok") return usageBlocked(usage);
 
     let rawSegments: RawSegment[];
     let durationS = 0;
@@ -115,16 +227,21 @@ Deno.serve(async (req: Request) => {
     let text = "";
 
     if (useMock) {
-      const mockRaw = Array.isArray(mock_segments)
-        ? (mock_segments as RawSegment[])
-        : [];
+      // Mock mode never touches Storage: the audio bytes are unused.
       rawSegments = mockRaw;
       durationS = rawSegments.length > 0 ? rawSegments[rawSegments.length - 1].end : 0;
       language = "en";
       text = rawSegments.map((s) => s.text).join(" ");
     } else {
+      // Download from Storage
+      const { data: fileBlob, error: dlErr } = await supabase.storage.from("episodes").download(audio_path);
+      if (dlErr || !fileBlob) {
+        console.error("[transcribe] audio download failed", dlErr);
+        return json({ error: "failed to fetch audio" }, 500);
+      }
+
       const formData = new FormData();
-      formData.append("file", new Blob([fileBuffer]), audio_path.split("/").pop() ?? "audio.mp3");
+      formData.append("file", fileBlob, audio_path.split("/").pop() ?? "audio.mp3");
       formData.append("model", model);
       formData.append("response_format", "verbose_json");
       formData.append("timestamp_granularities[]", "segment");
@@ -136,13 +253,27 @@ Deno.serve(async (req: Request) => {
       });
       if (!apiRes.ok) {
         const detail = await apiRes.text();
-        return json({ error: `transcription failed: ${apiRes.status} ${detail.slice(0, 200)}` }, 502);
+        console.error(`[transcribe] transcription failed: ${apiRes.status} ${detail.slice(0, 500)}`);
+        return json({ error: "transcription failed" }, 502);
       }
       const data = await apiRes.json();
       rawSegments = (data.segments ?? []).map((s: RawSegment) => ({ start: s.start, end: s.end, text: s.text }));
       durationS = data.duration ?? rawSegments[rawSegments.length - 1]?.end ?? 0;
       language = data.language ?? "unknown";
       text = data.text ?? "";
+
+      // The browser has no UPDATE on episodes, so record progress here with the service
+      // role: whitelisted columns only, on the verified row, while it is still transcribing.
+      const safeDuration = typeof durationS === "number" && Number.isFinite(durationS) && durationS >= 0 && durationS < 1e6
+        ? durationS
+        : 0;
+      const { error: progressErr } = await supabase
+        .from("episodes")
+        .update({ status: "scoring", duration_s: safeDuration })
+        .eq("id", episode_id)
+        .eq("audio_path", audio_path)
+        .in("status", ["uploading", "transcribing"]);
+      if (progressErr) console.error("[transcribe] episode progress update failed", progressErr);
     }
 
     const merged = mergeSegments(rawSegments);
@@ -155,6 +286,7 @@ Deno.serve(async (req: Request) => {
       full_text: text,
     });
   } catch (err) {
-    return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+    console.error("[transcribe] unhandled error", err);
+    return json({ error: "internal_error" }, 500);
   }
 });
